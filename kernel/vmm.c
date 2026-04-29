@@ -109,7 +109,7 @@ pte_t *page_walk(pagetable_t page_dir, uint64 va, int alloc)
     else
     { // PTE invalid (not exist).
       // allocate a page (to be the new pagetable), if alloc == 1
-      if (alloc && ((pt = (pte_t *)alloc_page(1)) != 0))
+      if (alloc && ((pt = (pte_t *)alloc_page()) != 0))
       {
         memset(pt, 0, PGSIZE);
         // writes the physical address of newly allocated page to pte, to establish the
