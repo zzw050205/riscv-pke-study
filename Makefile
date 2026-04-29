@@ -20,7 +20,7 @@ ifneq (,)
   mabi := -mabi=$(if $(is_32bit),ilp32,lp64)
 endif
 
-CFLAGS        := -Wall -Werror  -fno-builtin -nostdlib -D__NO_INLINE__ -mcmodel=medany -g -Og -std=gnu99 -Wno-unused -Wno-attributes -fno-delete-null-pointer-checks -fno-PIE $(march)
+CFLAGS        := -Wall -Werror  -fno-builtin -nostdlib -D__NO_INLINE__ -mcmodel=medany -g -O0 -std=gnu99 -Wno-unused -Wno-attributes -fno-delete-null-pointer-checks -fno-PIE $(march)
 COMPILE       	:= $(CC) -MMD -MP $(CFLAGS) $(SPROJS_INCLUDE)
 
 #---------------------	utils -----------------------
@@ -63,21 +63,36 @@ SPIKE_INF_LIB   := $(OBJ_DIR)/spike_interface.a
 
 
 #---------------------	user   -----------------------
-USER_CPPS 		:= user/*.c 
+USER_CPP0 		:= user/app_alloc0.c user/user_lib.c
+USER_CPP1 		:= user/app_alloc1.c user/user_lib.c
+USER_CPP_E0 	:= user/app_alloc_e0.c user/user_lib.c
+USER_CPP_E1 	:= user/app_alloc_e1.c user/user_lib.c
 
-USER_CPPS  		:= $(wildcard $(USER_CPPS))
-USER_OBJS  		:= $(addprefix $(OBJ_DIR)/, $(patsubst %.c,%.o,$(USER_CPPS)))
+USER_CPP0  		:= $(wildcard $(USER_CPP0))
+USER_CPP1  		:= $(wildcard $(USER_CPP1))
+USER_CPP_E0  	:= $(wildcard $(USER_CPP_E0))
+USER_CPP_E1  	:= $(wildcard $(USER_CPP_E1))
+USER_OBJ0  		:= $(addprefix $(OBJ_DIR)/, $(patsubst %.c,%.o,$(USER_CPP0)))
+USER_OBJ1  		:= $(addprefix $(OBJ_DIR)/, $(patsubst %.c,%.o,$(USER_CPP1)))
+USER_OBJ_E0  	:= $(addprefix $(OBJ_DIR)/, $(patsubst %.c,%.o,$(USER_CPP_E0)))
+USER_OBJ_E1  	:= $(addprefix $(OBJ_DIR)/, $(patsubst %.c,%.o,$(USER_CPP_E1)))
 
 
 
-USER_TARGET 	:= $(OBJ_DIR)/app_sum_sequence
+USER_TARGET0 	:= $(OBJ_DIR)/app_alloc0
+USER_TARGET1 	:= $(OBJ_DIR)/app_alloc1
+USER_TARGET_E0 	:= $(OBJ_DIR)/app_alloc_e0
+USER_TARGET_E1 	:= $(OBJ_DIR)/app_alloc_e1
 #------------------------targets------------------------
 $(OBJ_DIR):
 	@-mkdir -p $(OBJ_DIR)	
 	@-mkdir -p $(dir $(UTIL_OBJS))
 	@-mkdir -p $(dir $(SPIKE_INF_OBJS))
 	@-mkdir -p $(dir $(KERNEL_OBJS))
-	@-mkdir -p $(dir $(USER_OBJS))
+	@-mkdir -p $(dir $(USER_OBJ0))
+	@-mkdir -p $(dir $(USER_OBJ1))
+	@-mkdir -p $(dir $(USER_OBJ_E0))
+	@-mkdir -p $(dir $(USER_OBJ_E1))
 
 $(OBJ_DIR)/%.o : %.c
 	@echo "compiling" $<
@@ -102,9 +117,24 @@ $(KERNEL_TARGET): $(OBJ_DIR) $(UTIL_LIB) $(SPIKE_INF_LIB) $(KERNEL_OBJS) $(KERNE
 	@$(COMPILE) $(KERNEL_OBJS) $(UTIL_LIB) $(SPIKE_INF_LIB) -o $@ -T $(KERNEL_LDS)
 	@echo "PKE core has been built into" \"$@\"
 
-$(USER_TARGET): $(OBJ_DIR) $(UTIL_LIB) $(USER_OBJS)
+$(USER_TARGET0): $(OBJ_DIR) $(UTIL_LIB) $(USER_OBJ0)
 	@echo "linking" $@	...	
-	@$(COMPILE) --entry=main $(USER_OBJS) $(UTIL_LIB) -o $@
+	@$(COMPILE) --entry=main $(USER_OBJ0) $(UTIL_LIB) -o $@
+	@echo "User app has been built into" \"$@\"
+	
+$(USER_TARGET1): $(OBJ_DIR) $(UTIL_LIB) $(USER_OBJ1)
+	@echo "linking" $@	...	
+	@$(COMPILE) --entry=main $(USER_OBJ1) $(UTIL_LIB) -o $@
+	@echo "User app has been built into" \"$@\"
+
+$(USER_TARGET_E0): $(OBJ_DIR) $(UTIL_LIB) $(USER_OBJ_E0)
+	@echo "linking" $@	...	
+	@$(COMPILE) --entry=main $(USER_OBJ_E0) $(UTIL_LIB) -o $@
+	@echo "User app has been built into" \"$@\"
+
+$(USER_TARGET_E1): $(OBJ_DIR) $(UTIL_LIB) $(USER_OBJ_E1)
+	@echo "linking" $@	...	
+	@$(COMPILE) --entry=main $(USER_OBJ_E1) $(UTIL_LIB) -o $@
 	@echo "User app has been built into" \"$@\"
 
 -include $(wildcard $(OBJ_DIR)/*/*.d)
@@ -112,16 +142,20 @@ $(USER_TARGET): $(OBJ_DIR) $(UTIL_LIB) $(USER_OBJS)
 
 .DEFAULT_GOAL := $(all)
 
-all: $(KERNEL_TARGET) $(USER_TARGET)
+all: $(KERNEL_TARGET) $(USER_TARGET0) $(USER_TARGET1)
 .PHONY:all
 
-run: $(KERNEL_TARGET) $(USER_TARGET)
+run: $(KERNEL_TARGET) $(USER_TARGET0) $(USER_TARGET1)
 	@echo "********************HUST PKE********************"
-	spike $(KERNEL_TARGET) $(USER_TARGET)
+	spike -p2 $(KERNEL_TARGET) $(USER_TARGET0) $(USER_TARGET1)
+
+run_e: $(KERNEL_TARGET) $(USER_TARGET_E0) $(USER_TARGET_E1)
+	@echo "********************HUST PKE********************"
+	spike -p2 $(KERNEL_TARGET) $(USER_TARGET_E0) $(USER_TARGET_E1)
 
 # need openocd!
-gdb:$(KERNEL_TARGET) $(USER_TARGET)
-	spike --rbb-port=9824 -H $(KERNEL_TARGET) $(USER_TARGET) &
+gdb:$(KERNEL_TARGET) $(USER_TARGET0) $(USER_TARGET1)
+	spike --rbb-port=9824 -H -p2 $(KERNEL_TARGET) $(USER_TARGET0) $(USER_TARGET1) &
 	@sleep 1
 	openocd -f ./.spike.cfg &
 	@sleep 1
@@ -135,7 +169,8 @@ gdb_clean:
 
 objdump:
 	riscv64-unknown-elf-objdump -d $(KERNEL_TARGET) > $(OBJ_DIR)/kernel_dump
-	riscv64-unknown-elf-objdump -d $(USER_TARGET) > $(OBJ_DIR)/user_dump
+	riscv64-unknown-elf-objdump -d $(USER_TARGET0) > $(OBJ_DIR)/app_alloc0_dump
+	riscv64-unknown-elf-objdump -d $(USER_TARGET1) > $(OBJ_DIR)/app_alloc1_dump
 
 cscope:
 	find ./ -name "*.c" > cscope.files
