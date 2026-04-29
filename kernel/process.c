@@ -32,9 +32,6 @@ process procs[NPROC];
 // current points to the currently running user-mode application.
 process *current = NULL;
 
-// points to the first free page in our simple heap. added @lab2_2
-uint64 g_ufree_page = USER_FREE_ADDRESS_START;
-
 //
 // switch to a user-mode process
 //
@@ -160,6 +157,10 @@ process *alloc_process()
 
   procs[i].total_mapped_region = 4;
 
+  // initialize files_struct
+  procs[i].pfiles = init_proc_file_management();
+  sprint("in alloc_proc. build proc_file_management successfully.\n");
+
   // return after initialization.
   return &procs[i];
 }
@@ -206,21 +207,20 @@ int do_fork(process *parent)
     case HEAP_SEGMENT:
     {
       // build a same heap for child process.
-
       // convert free_pages_address into a filter to skip reclaimed blocks in the heap
       // when mapping the heap blocks
       int free_block_filter[MAX_HEAP_PAGES];
       memset(free_block_filter, 0, MAX_HEAP_PAGES);
       uint64 heap_bottom = parent->user_heap.heap_bottom;
-      for (int i = 0; i < parent->user_heap.free_pages_count; i++)
+      for (int j = 0; j < parent->user_heap.free_pages_count; j++)
       {
-        int index = (parent->user_heap.free_pages_address[i] - heap_bottom) / PGSIZE;
+        int index = (parent->user_heap.free_pages_address[j] - heap_bottom) / PGSIZE;
         free_block_filter[index] = 1;
       }
 
       // copy and map the heap blocks
-      for (uint64 heap_block = current->user_heap.heap_bottom;
-           heap_block < current->user_heap.heap_top; heap_block += PGSIZE)
+      for (uint64 heap_block = parent->user_heap.heap_bottom;
+           heap_block < parent->user_heap.heap_top; heap_block += PGSIZE)
       {
         if (free_block_filter[(heap_block - heap_bottom) / PGSIZE]) // skip free blocks
           continue;
@@ -239,30 +239,54 @@ int do_fork(process *parent)
     break;
     case CODE_SEGMENT:
     {
-      // TODO (lab3_1): implment the mapping of child code segment to parent's
-      // code segment.
-      // hint: the virtual address mapping of code segment is tracked in mapped_info
-      // page of parent's process structure. use the information in mapped_info to
-      // retrieve the virtual to physical mapping of code segment.
-      // after having the mapping information, just map the corresponding virtual
-      // address region of child to the physical pages that actually store the code
-      // segment of parent process.
-      // DO NOT COPY THE PHYSICAL PAGES, JUST MAP THEM.
-      for (int j = 0; j < parent->mapped_info[i].npages; j++)
+      // shared mapping for code segment
+      uint64 va = parent->mapped_info[i].va;
+      uint32 npages = parent->mapped_info[i].npages;
+      for (int j = 0; j < npages; j++)
       {
-        uint64 va = parent->mapped_info[i].va + j * PGSIZE;
-        uint64 pa = lookup_pa(parent->pagetable, va);
-        user_vm_map(child->pagetable, va, PGSIZE, pa, prot_to_type(PROT_READ | PROT_EXEC, 1));
+        uint64 pa = lookup_pa(parent->pagetable, va + j * PGSIZE);
+        user_vm_map(child->pagetable, va + j * PGSIZE, PGSIZE, pa,
+                    prot_to_type(PROT_READ | PROT_EXEC, 1));
       }
-
-      // after mapping, register the vm region (do not delete codes below!)
-      child->mapped_info[child->total_mapped_region].va = parent->mapped_info[i].va;
-      child->mapped_info[child->total_mapped_region].npages =
-          parent->mapped_info[i].npages;
+      // after mapping, register the vm region
+      child->mapped_info[child->total_mapped_region].va = va;
+      child->mapped_info[child->total_mapped_region].npages = npages;
       child->mapped_info[child->total_mapped_region].seg_type = CODE_SEGMENT;
       child->total_mapped_region++;
     }
     break;
+    case DATA_SEGMENT:
+    {
+      // copy mapping for data segment
+      uint64 va = parent->mapped_info[i].va;
+      uint32 npages = parent->mapped_info[i].npages;
+      for (int j = 0; j < npages; j++)
+      {
+        uint64 pa = lookup_pa(parent->pagetable, va + j * PGSIZE);
+        void *child_pa = alloc_page();
+        memcpy(child_pa, (void *)pa, PGSIZE);
+        user_vm_map(child->pagetable, va + j * PGSIZE, PGSIZE, (uint64)child_pa,
+                    prot_to_type(PROT_READ | PROT_WRITE, 1));
+      }
+      child->mapped_info[child->total_mapped_region].va = va;
+      child->mapped_info[child->total_mapped_region].npages = npages;
+      child->mapped_info[child->total_mapped_region].seg_type = DATA_SEGMENT;
+      child->total_mapped_region++;
+    }
+    break;
+    }
+  }
+
+  // inherit file descriptors
+  child->pfiles->cwd = parent->pfiles->cwd;
+  child->pfiles->cwd->d_ref++;
+  for (int i = 0; i < MAX_FILES; i++)
+  {
+    if (parent->pfiles->opened_files[i].status != FD_NONE)
+    {
+      memcpy(&child->pfiles->opened_files[i], &parent->pfiles->opened_files[i], sizeof(struct file));
+      child->pfiles->opened_files[i].f_dentry->d_ref++;
+      child->pfiles->nfiles++;
     }
   }
 
