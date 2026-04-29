@@ -1,0 +1,657 @@
+diff --git a/Makefile b/Makefile
+index 46ce829..936bbec 100644
+--- a/Makefile
++++ b/Makefile
+@@ -157,4 +157,4 @@ format:
+ 	@python ./format.py ./
+ 
+ clean:
+-	rm -fr ${OBJ_DIR}
+\ No newline at end of file
++	rm -fr ${OBJ_DIR}
+diff --git a/kernel/config.h b/kernel/config.h
+index bdc8270..7275b64 100644
+--- a/kernel/config.h
++++ b/kernel/config.h
+@@ -2,7 +2,7 @@
+ #define _CONFIG_H_
+ 
+ // we use only one HART (cpu) in fundamental experiments
+-#define NCPU 1
++#define NCPU 2
+ 
+ //interval of timer interrupt. added @lab1_3
+ #define TIMER_INTERVAL 1000000
+diff --git a/kernel/elf.c b/kernel/elf.c
+index 245c840..f5f36be 100644
+--- a/kernel/elf.c
++++ b/kernel/elf.c
+@@ -123,14 +123,15 @@ void load_bincode_from_host_elf(process *p) {
+   size_t argc = parse_args(&arg_bug_msg);
+   if (!argc) panic("You need to specify the application program!\n");
+ 
+-  sprint("hartid = ?: Application: %s\n", arg_bug_msg.argv[0]);
++  uint64 hartid = read_tp();
++  sprint("hartid = %ld: Application: %s\n", hartid, arg_bug_msg.argv[hartid]);
+ 
+   //elf loading. elf_ctx is defined in kernel/elf.h, used to track the loading process.
+   elf_ctx elfloader;
+   // elf_info is defined above, used to tie the elf file and its corresponding process.
+   elf_info info;
+ 
+-  info.f = spike_file_open(arg_bug_msg.argv[0], O_RDONLY, 0);
++  info.f = spike_file_open(arg_bug_msg.argv[hartid], O_RDONLY, 0);
+   info.p = p;
+   // IS_ERR_VALUE is a macro defined in spike_interface/spike_htif.h
+   if (IS_ERR_VALUE(info.f)) panic("Fail on openning the input application program.\n");
+@@ -148,5 +149,6 @@ void load_bincode_from_host_elf(process *p) {
+   // close the host spike file
+   spike_file_close( info.f );
+ 
+-  sprint("hartid = ?: Application program entry point (virtual address): 0x%lx\n", p->trapframe->epc);
++  sprint("hartid = %ld: Application program entry point (virtual address): 0x%lx\n",
++      hartid, p->trapframe->epc);
+ }
+diff --git a/kernel/kernel.c b/kernel/kernel.c
+index 1edbf7c..9b84b9d 100644
+--- a/kernel/kernel.c
++++ b/kernel/kernel.c
+@@ -2,6 +2,7 @@
+  * Supervisor-mode startup codes
+  */
+ 
++#include "config.h"
+ #include "riscv.h"
+ #include "string.h"
+ #include "elf.h"
+@@ -10,9 +11,10 @@
+ #include "vmm.h"
+ #include "memlayout.h"
+ #include "spike_interface/spike_utils.h"
++#include "sync_utils.h"
+ 
+ // process is a structure defined in kernel/process.h
+-process user_app;
++process user_app[NCPU];
+ 
+ //
+ // trap_sec_start points to the beginning of S-mode trap segment (i.e., the entry point of
+@@ -36,10 +38,13 @@ void enable_paging() {
+ // load_bincode_from_host_elf is defined in elf.c
+ //
+ void load_user_program(process *proc) {
+-  sprint("User application is loading.\n");
++  uint64 hartid = read_tp();
++  sprint("hartid = %ld: User application is loading.\n", hartid);
+   // allocate a page to store the trapframe. alloc_page is defined in kernel/pmm.c. added @lab2_1
+   proc->trapframe = (trapframe *)alloc_page();
+   memset(proc->trapframe, 0, sizeof(trapframe));
++  
++  proc->ufree_page = USER_FREE_ADDRESS_START;
+ 
+   // allocate a page to store page directory. added @lab2_1
+   proc->pagetable = (pagetable_t)alloc_page();
+@@ -52,8 +57,8 @@ void load_user_program(process *proc) {
+   // USER_STACK_TOP = 0x7ffff000, defined in kernel/memlayout.h
+   proc->trapframe->regs.sp = USER_STACK_TOP;  //virtual address of user stack top
+ 
+-  sprint("hartid = ?: user frame 0x%lx, user stack 0x%lx, user kstack 0x%lx \n", proc->trapframe,
+-         proc->trapframe->regs.sp, proc->kstack);
++  sprint("hartid = %ld: user frame 0x%lx, user stack 0x%lx, user kstack 0x%lx \n",
++      hartid, proc->trapframe, proc->trapframe->regs.sp, proc->kstack);
+ 
+   // load_bincode_from_host_elf() is defined in kernel/elf.c
+   load_bincode_from_host_elf(proc);
+@@ -73,37 +78,42 @@ void load_user_program(process *proc) {
+          prot_to_type(PROT_READ | PROT_EXEC, 0));
+ }
+ 
++volatile int sstart_harts = 0;
+ //
+ // s_start: S-mode entry point of riscv-pke OS kernel.
+ //
+ int s_start(void) {
+-  sprint("hartid = ?: Enter supervisor mode...\n");
++  uint64 hartid = read_tp();
++
++  sprint("hartid = %ld: Enter supervisor mode...\n", hartid);
+   // in the beginning, we use Bare mode (direct) memory mapping as in lab1.
+   // but now, we are going to switch to the paging mode @lab2_1.
+   // note, the code still works in Bare mode when calling pmm_init() and kern_vm_init().
+   write_csr(satp, 0);
+ 
+-  // init phisical memory manager
+-  pmm_init();
++  if (hartid == 0) {
++    // init phisical memory manager
++    pmm_init();
+ 
+-  // build the kernel page table
+-  kern_vm_init();
++    // build the kernel page table
++    kern_vm_init();
+ 
+-  // now, switch to paging mode by turning on paging (SV39)
+-  enable_paging();
+-  // the code now formally works in paging mode, meaning the page table is now in use.
+-  sprint("kernel page table is on \n");
++    // the application code (elf) is first loaded into memory, and then put into
++    // execution
++  }
++  sync_barrier(&sstart_harts, NCPU);
+ 
+-  // the application code (elf) is first loaded into memory, and then put into execution
+-  load_user_program(&user_app);
++  // now, switch to paging mode by turning on paging (SV39)
+ 
+-  sprint("hartid = ?: Switch to user mode...\n");
++  enable_paging();
+   
+-  uint64 hartid = 0;
++  load_user_program(&user_app[hartid]);
++
++  sprint("hartid = %ld: Switch to user mode...\n", hartid);
+   
+   vm_alloc_stage[hartid] = 1;
+   // switch_to() is defined in kernel/process.c
+-  switch_to(&user_app);
++  switch_to(&user_app[hartid]);
+ 
+   // we should never reach here.
+   return 0;
+diff --git a/kernel/machine/minit.c b/kernel/machine/minit.c
+index b258f71..8a7019b 100644
+--- a/kernel/machine/minit.c
++++ b/kernel/machine/minit.c
+@@ -6,6 +6,7 @@
+ #include "kernel/riscv.h"
+ #include "kernel/config.h"
+ #include "spike_interface/spike_utils.h"
++#include "kernel/sync_utils.h"
+ 
+ //
+ // global variables are placed in the .data section.
+@@ -87,19 +88,24 @@ void timerinit(uintptr_t hartid) {
+   write_csr(mie, read_csr(mie) | MIE_MTIE);
+ }
+ 
++volatile int mstart_harts = 0;
+ //
+ // m_start: machine mode C entry point.
+ //
+ void m_start(uintptr_t hartid, uintptr_t dtb) {
+-  // init the spike file interface (stdin,stdout,stderr)
+-  // functions with "spike_" prefix are all defined in codes under spike_interface/,
+-  // sprint is also defined in spike_interface/spike_utils.c
+-  spike_file_init();
+-  sprint("In m_start, hartid:%d\n", hartid);
++  if (hartid == 0) {
++    // init the spike file interface (stdin,stdout,stderr)
++    // functions with "spike_" prefix are all defined in codes under
++    // spike_interface/, sprint is also defined in spike_interface/spike_utils.c
++    spike_file_init();
+ 
+-  // init HTIF (Host-Target InterFace) and memory by using the Device Table Blob (DTB)
+-  // init_dtb() is defined above.
+-  init_dtb(dtb);
++    // init HTIF (Host-Target InterFace) and memory by using the Device Table
++    // Blob (DTB) init_dtb() is defined above.
++    init_dtb(dtb);
++
++  }
++  sync_barrier(&mstart_harts, NCPU);
++  sprint("In m_start, hartid:%d\n", hartid);
+ 
+   // save the address of trap frame for interrupt in M mode to "mscratch". added @lab1_2
+   write_csr(mscratch, &g_itrframe);
+@@ -127,6 +133,9 @@ void m_start(uintptr_t hartid, uintptr_t dtb) {
+   // init timing. added @lab1_3
+   timerinit(hartid);
+ 
++  // store hartid in tp
++  write_tp(hartid);
++
+   // switch to supervisor mode (S mode) and jump to s_start(), i.e., set pc to mepc
+   asm volatile("mret");
+ }
+diff --git a/kernel/machine/mtrap.c b/kernel/machine/mtrap.c
+index e431e7d..55451d4 100644
+--- a/kernel/machine/mtrap.c
++++ b/kernel/machine/mtrap.c
+@@ -16,7 +16,7 @@ static void handle_misaligned_store() { panic("Misaligned AMO!"); }
+ 
+ // added @lab1_3
+ static void handle_timer() {
+-  int cpuid = read_csr(mhartid);
++  uint64 cpuid = read_csr(mhartid);
+   // setup the timer fired at next time (TIMER_INTERVAL from now)
+   *(uint64*)CLINT_MTIMECMP(cpuid) = *(uint64*)CLINT_MTIMECMP(cpuid) + TIMER_INTERVAL;
+ 
+diff --git a/kernel/pmm.c b/kernel/pmm.c
+index 9517d2a..2ef090e 100644
+--- a/kernel/pmm.c
++++ b/kernel/pmm.c
+@@ -5,6 +5,7 @@
+ #include "util/string.h"
+ #include "memlayout.h"
+ #include "spike_interface/spike_utils.h"
++#include "sync_utils.h"
+ 
+ // _end is defined in kernel/kernel.lds, it marks the ending (virtual) address of PKE kernel
+ extern char _end[];
+@@ -15,7 +16,8 @@ extern uint64 g_mem_size;
+ static uint64 free_mem_start_addr;  //beginning address of free memory
+ static uint64 free_mem_end_addr;    //end address of free memory (not included)
+ 
+-int vm_alloc_stage[NCPU] = { 0 }; // 0 for kernel alloc, 1 for user alloc
++spinlock_t pmm_lock = 0;
++
+ typedef struct node {
+   struct node *next;
+ } list_node;
+@@ -23,6 +25,8 @@ typedef struct node {
+ // g_free_mem_list is the head of the list of free physical memory pages
+ static list_node g_free_mem_list;
+ 
++int vm_alloc_stage[NCPU] = {0}; // 0 for kernel alloc, 1 for user alloc
++
+ //
+ // actually creates the freepage list. each page occupies 4KB (PGSIZE), i.e., small page.
+ // PGSIZE is defined in kernel/riscv.h, ROUNDUP is defined in util/functions.h.
+@@ -37,13 +41,15 @@ static void create_freepage_list(uint64 start, uint64 end) {
+ // place a physical page at *pa to the free list of g_free_mem_list (to reclaim the page)
+ //
+ void free_page(void *pa) {
++  uint64 hartid = read_tp();
++    spin_lock(&pmm_lock);
+   if (((uint64)pa % PGSIZE) != 0 || (uint64)pa < free_mem_start_addr || (uint64)pa >= free_mem_end_addr)
+     panic("free_page 0x%lx \n", pa);
+-
+   // insert a physical page to g_free_mem_list
+   list_node *n = (list_node *)pa;
+   n->next = g_free_mem_list.next;
+   g_free_mem_list.next = n;
++  spin_unlock(&pmm_lock);
+ }
+ 
+ //
+@@ -51,12 +57,14 @@ void free_page(void *pa) {
+ // Allocates only ONE page!
+ //
+ void *alloc_page(void) {
++  spin_lock(&pmm_lock);
+   list_node *n = g_free_mem_list.next;
+-  uint64 hartid = 0;
++  uint64 hartid = read_tp();
+   if (vm_alloc_stage[hartid]) {
+     sprint("hartid = %ld: alloc page 0x%x\n", hartid, n);
+   }
+   if (n) g_free_mem_list.next = n->next;
++  spin_unlock(&pmm_lock);
+   return (void *)n;
+ }
+ 
+diff --git a/kernel/pmm.h b/kernel/pmm.h
+index bd5ba21..47e5cd1 100644
+--- a/kernel/pmm.h
++++ b/kernel/pmm.h
+@@ -2,11 +2,12 @@
+ #define _PMM_H_
+ 
+ #include "config.h"
+-
+ // Initialize phisical memeory manager
+ void pmm_init();
++
+ // Allocate a free phisical page
+-void* alloc_page();
++void *alloc_page();
++
+ // Free an allocated page
+ void free_page(void* pa);
+ 
+diff --git a/kernel/process.c b/kernel/process.c
+index d909533..47a9592 100644
+--- a/kernel/process.c
++++ b/kernel/process.c
+@@ -22,17 +22,15 @@ extern char smode_trap_vector[];
+ extern void return_to_user(trapframe *, uint64 satp);
+ 
+ // current points to the currently running user-mode application.
+-process* current = NULL;
+-
+-// points to the first free page in our simple heap. added @lab2_2
+-uint64 g_ufree_page = USER_FREE_ADDRESS_START;
++process* current[NCPU] = {0};
+ 
+ //
+ // switch to a user-mode process
+ //
+ void switch_to(process* proc) {
+   assert(proc);
+-  current = proc;
++  uint64 hartid = read_tp();
++  current[hartid] = proc;
+ 
+   // write the smode_trap_vector (64-bit func. address) defined in kernel/strap_vector.S
+   // to the stvec privilege register, such that trap handler pointed by smode_trap_vector
+@@ -41,6 +39,7 @@ void switch_to(process* proc) {
+ 
+   // set up trapframe values (in process structure) that smode_trap_vector will need when
+   // the process next re-enters the kernel.
++  proc->trapframe->regs.tp = hartid;
+   proc->trapframe->kernel_sp = proc->kstack;      // process's kernel stack
+   proc->trapframe->kernel_satp = read_csr(satp);  // kernel page table
+   proc->trapframe->kernel_trap = (uint64)smode_trap_handler;
+@@ -62,5 +61,6 @@ void switch_to(process* proc) {
+ 
+   // return_to_user() is defined in kernel/strap_vector.S. switch to user mode with sret.
+   // note, return_to_user takes two parameters @ and after lab2_1.
++//   sprint("hartid = %ld: return to user\n", read_tp());
+   return_to_user(proc->trapframe, user_satp);
+ }
+diff --git a/kernel/process.h b/kernel/process.h
+index c1278a9..036e0d6 100644
+--- a/kernel/process.h
++++ b/kernel/process.h
+@@ -1,6 +1,7 @@
+ #ifndef _PROC_H_
+ #define _PROC_H_
+ 
++#include "config.h"
+ #include "riscv.h"
+ 
+ typedef struct trapframe_t {
+@@ -26,15 +27,13 @@ typedef struct process_t {
+   pagetable_t pagetable;
+   // trapframe storing the context of a (User mode) process.
+   trapframe* trapframe;
++  uint64 ufree_page;
+ }process;
+ 
+ // switch to run user app
+ void switch_to(process*);
+ 
+ // current running process
+-extern process* current;
+-
+-// address of the first free page in our simple heap. added @lab2_2
+-extern uint64 g_ufree_page;
++extern process* current[NCPU];
+ 
+ #endif
+diff --git a/kernel/strap.c b/kernel/strap.c
+index 9487d1f..7bf26b5 100644
+--- a/kernel/strap.c
++++ b/kernel/strap.c
+@@ -32,16 +32,17 @@ static void handle_syscall(trapframe *tf) {
+ 
+ //
+ // global variable that store the recorded "ticks". added @lab1_3
+-static uint64 g_ticks = 0;
++static uint64 g_ticks[NCPU] = {0};
+ //
+ // added @lab1_3
+ //
+ void handle_mtimer_trap() {
+-  sprint("Ticks %d\n", g_ticks);
++  uint64 hartid = read_tp();
++  sprint("Ticks %d\n", g_ticks[hartid]);
+   // TODO (lab1_3): increase g_ticks to record this "tick", and then clear the "SIP"
+   // field in sip register.
+   // hint: use write_csr to disable the SIP_SSIP bit in sip.
+-  ++g_ticks;
++  ++g_ticks[hartid];
+   write_csr(sip, read_csr(sip) & ~SIP_SSIP);
+ 
+ }
+@@ -52,7 +53,8 @@ void handle_mtimer_trap() {
+ // stval: the virtual address that causes pagefault when being accessed.
+ //
+ void handle_user_page_fault(uint64 mcause, uint64 sepc, uint64 stval) {
+-  sprint("handle_page_fault: %lx\n", stval);
++  uint64 hartid = read_tp();
++
+   switch (mcause) {
+     case CAUSE_STORE_PAGE_FAULT:
+       // TODO (lab2_3): implement the operations that solve the page fault to
+@@ -61,8 +63,9 @@ void handle_user_page_fault(uint64 mcause, uint64 sepc, uint64 stval) {
+       // virtual address that causes the page fault.
+       {
+       uint64 newpage = (uint64)alloc_page();
+-      user_vm_map((pagetable_t)current->pagetable, ROUNDDOWN(stval, PGSIZE), PGSIZE, newpage,
+-             prot_to_type(PROT_WRITE | PROT_READ, 1));
++      user_vm_map((pagetable_t)current[hartid]->pagetable,
++                  ROUNDDOWN(stval, PGSIZE), PGSIZE, newpage,
++                  prot_to_type(PROT_WRITE | PROT_READ, 1));
+       }
+ 
+       break;
+@@ -80,10 +83,12 @@ void smode_trap_handler(void) {
+   // make sure we are in User mode before entering the trap handling.
+   // we will consider other previous case in lab1_3 (interrupt).
+   if ((read_csr(sstatus) & SSTATUS_SPP) != 0) panic("usertrap: not from user mode");
+-
+-  assert(current);
++  uint64 hartid = read_tp();
++  assert(current[hartid]);
+   // save user process counter.
+-  current->trapframe->epc = read_csr(sepc);
++  current[hartid]->trapframe->epc = read_csr(sepc);
++
++//   sprint("hartid = %ld: strap current proc 0x%x\n", hartid, &current[hartid]);
+ 
+   // if the cause of trap is syscall from user application.
+   // read_csr() and CAUSE_USER_ECALL are macros defined in kernel/riscv.h
+@@ -92,7 +97,10 @@ void smode_trap_handler(void) {
+   // use switch-case instead of if-else, as there are many cases since lab2_3.
+   switch (cause) {
+     case CAUSE_USER_ECALL:
+-      handle_syscall(current->trapframe);
++    //   sprint("hartid = %ld: strap syscall\n", read_tp());
++
++      handle_syscall(current[hartid]->trapframe);
++
+       break;
+     case CAUSE_MTIMER_S_TRAP:
+       handle_mtimer_trap();
+@@ -110,6 +118,6 @@ void smode_trap_handler(void) {
+       break;
+   }
+ 
+-  // continue (come back to) the execution of current process.
+-  switch_to(current);
++  // continue (come back to) the execution of current[hartid] process.
++  switch_to(current[hartid]);
+ }
+diff --git a/kernel/sync_utils.h b/kernel/sync_utils.h
+index 988fc4c..d8b01b6 100644
+--- a/kernel/sync_utils.h
++++ b/kernel/sync_utils.h
+@@ -1,6 +1,35 @@
+ #ifndef _SYNC_UTILS_H_
+ #define _SYNC_UTILS_H_
+ 
++typedef volatile int spinlock_t __attribute__((aligned(4)));
++
++static inline void spin_lock(spinlock_t *lock) {
++  int tmp;
++  asm volatile(
++      "1: li %0, 1\n" // Load immediate 1 into tmp, marking locked state
++      "   amoswap.w.aq %0, %0, %1\n" // Atomically swap lock with tmp (1), set
++                                     // lock to 1, previous value into tmp
++      "   bnez %0, 1b\n" // If tmp was not 0 (lock was held), loop and try again
++      : "=r"(tmp), "+A"(*lock) // Output and input: tmp is output, lock is
++                               // input+output (memory operand)
++      :                        // No unlisted inputs
++      : "memory" // Clobber memory to prevent reordering by the compiler
++  );
++}
++
++static inline void spin_unlock(spinlock_t *lock) {
++  asm volatile(
++      "   li t0, 0\n" // Load immediate 0 into a temporary register, t0
++      "   amoswap.w.rl zero, t0, (%0)\n" // Atomically swap the lock with 0,
++                                         // releasing it, with release semantics
++      :
++      : "r"(lock) // Input: Address of the lock, using a register to hold the
++                  // address
++      : "memory", "t0" // Clobber memory to ensure memory ordering, and t0 as
++                       // it's used here
++  );
++}
++
+ static inline void sync_barrier(volatile int *counter, int all) {
+ 
+   int local;
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 2d666d6..12f5125 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -5,6 +5,9 @@
+ #include <stdint.h>
+ #include <errno.h>
+ 
++#include "config.h"
++#include "riscv.h"
++#include "sync_utils.h"
+ #include "util/types.h"
+ #include "syscall.h"
+ #include "string.h"
+@@ -20,21 +23,31 @@
+ ssize_t sys_user_print(const char* buf, size_t n) {
+   // buf is now an address in user space of the given app's user stack,
+   // so we have to transfer it into phisical address (kernel is running in direct mapping).
+-  assert( current );
+-  char* pa = (char*)user_va_to_pa((pagetable_t)(current->pagetable), (void*)buf);
++  uint64 hartid = read_tp();
++  assert( current[hartid] );
++  char *pa = (char *)user_va_to_pa((pagetable_t)(current[hartid]->pagetable),
++                                   (void *)buf);
+   sprint(pa);
+   return 0;
+ }
+ 
++
++volatile int exit_barrier = 0;
+ //
+ // implement the SYS_user_exit syscall
+ //
+ ssize_t sys_user_exit(uint64 code) {
+-  sprint("hartid = ?: User exit with code:%d.\n", code);
++  uint64 hartid = read_tp();
++
++  sprint("hartid = %ld: User exit with code: %d.\n", hartid, code);
+   // in lab1, PKE considers only one app (one process). 
+   // therefore, shutdown the system when the app calls exit()
+-  sprint("hartid = ?: shutdown with code:%d.\n", code);
+-  shutdown(code);
++  sync_barrier(&exit_barrier, NCPU);
++  if (hartid == 0) {
++    sprint("hartid = %ld: shutdown with code: %d.\n", hartid, code);
++    shutdown(code);
++  }
++  return 0;
+ }
+ 
+ //
+@@ -42,11 +55,13 @@ ssize_t sys_user_exit(uint64 code) {
+ //
+ uint64 sys_user_allocate_page() {
+   void* pa = alloc_page();
+-  uint64 va = g_ufree_page;
+-  g_ufree_page += PGSIZE;
+-  user_vm_map((pagetable_t)current->pagetable, va, PGSIZE, (uint64)pa,
+-         prot_to_type(PROT_WRITE | PROT_READ, 1));
+-  sprint("hartid = ?: vaddr 0x%x is mapped to paddr 0x%x\n", va, pa);
++  uint64 hartid = read_tp();
++  process *cur_proc = current[hartid];
++  uint64 va = cur_proc->ufree_page;
++  cur_proc->ufree_page += PGSIZE;
++  user_vm_map((pagetable_t)current[hartid]->pagetable, va, PGSIZE, (uint64)pa,
++              prot_to_type(PROT_WRITE | PROT_READ, 1));
++  sprint("hartid = %ld: vaddr 0x%x is mapped to paddr 0x%x\n", hartid, va, pa);
+   return va;
+ }
+ 
+@@ -54,7 +69,8 @@ uint64 sys_user_allocate_page() {
+ // reclaim a page, indicated by "va". added @lab2_2
+ //
+ uint64 sys_user_free_page(uint64 va) {
+-  user_vm_unmap((pagetable_t)current->pagetable, va, PGSIZE, 1);
++  uint64 hartid = read_tp();
++  user_vm_unmap((pagetable_t)current[hartid]->pagetable, va, PGSIZE, 1);
+   return 0;
+ }
+ 
+diff --git a/kernel/vmm.c b/kernel/vmm.c
+index 46c695d..b766313 100644
+--- a/kernel/vmm.c
++++ b/kernel/vmm.c
+@@ -19,12 +19,16 @@
+ int map_pages(pagetable_t page_dir, uint64 va, uint64 size, uint64 pa, int perm) {
+   uint64 first, last;
+   pte_t *pte;
++  
++  uint64 hartid = read_tp();
+ 
+   for (first = ROUNDDOWN(va, PGSIZE), last = ROUNDDOWN(va + size - 1, PGSIZE);
+       first <= last; first += PGSIZE, pa += PGSIZE) {
+     if ((pte = page_walk(page_dir, first, 1)) == 0) return -1;
+-    if (*pte & PTE_V)
+-      panic("map_pages fails on mapping va (0x%lx) to pa (0x%lx)", first, pa);
++    if (*pte & PTE_V) {
++      sprint("hartid = %ld: map_pages fails on mapping va (0x%lx) to pa (0x%lx)", hartid, first, pa);
++      panic();
++    }
+     *pte = PA2PTE(pa) | perm | PTE_V;
+   }
+   return 0;
+@@ -68,7 +72,7 @@ pte_t *page_walk(pagetable_t page_dir, uint64 va, int alloc) {
+       pt = (pagetable_t)PTE2PA(*pte);
+     } else { //PTE invalid (not exist).
+       // allocate a page (to be the new pagetable), if alloc == 1
+-      if( alloc && ((pt = (pte_t *)alloc_page(1)) != 0) ){
++      if( alloc && ((pt = (pte_t *)alloc_page()) != 0) ){
+         memset(pt, 0, PGSIZE);
+         // writes the physical address of newly allocated page to pte, to establish the
+         // page table tree.
+diff --git a/user/app_alloc0.c b/user/app_alloc0.c
+index 6e491c9..e23d2c6 100644
+--- a/user/app_alloc0.c
++++ b/user/app_alloc0.c
+@@ -6,14 +6,14 @@
+ 
+ int main(void) {
+   void *p[N];
+-
++  
+   for (int i = 0; i < N; i++) {
+     p[i] = naive_malloc();
+     int *pi = p[i];
+     *pi = BASE + i;
+     printu("=== user alloc 0 @ vaddr 0x%x\n", p[i]);
+   }
+-
++  
+   for (int i = 0; i < N; i++) {
+     int *pi = p[i];
+     printu("=== user0: %d\n", *pi);
+@@ -21,4 +21,4 @@ int main(void) {
+   }
+ 
+   exit(0);
+-}
+\ No newline at end of file
++}
+diff --git a/user/app_alloc1.c b/user/app_alloc1.c
+index 440765f..629afab 100644
+--- a/user/app_alloc1.c
++++ b/user/app_alloc1.c
+@@ -21,4 +21,4 @@ int main(void) {
+   }
+ 
+   exit(0);
+-}
+\ No newline at end of file
++}

@@ -1,0 +1,309 @@
+diff --git a/kernel/process.c b/kernel/process.c
+index 4fb9b61..f999d24 100644
+--- a/kernel/process.c
++++ b/kernel/process.c
+@@ -17,6 +17,7 @@
+ #include "memlayout.h"
+ #include "sched.h"
+ #include "spike_interface/spike_utils.h"
++#include "util/functions.h"
+ 
+ //Two functions defined in kernel/usertrap.S
+ extern char smode_trap_vector[];
+@@ -264,3 +265,105 @@ int do_fork( process* parent)
+ 
+   return child->pid;
+ }
++
++//
++// release the elf segments in memory regions (for reload).
++//
++int release_elf_seg(process *proc) {
++  for (int i = 4; i < proc->total_mapped_region; i++) {
++    user_vm_unmap(proc->pagetable, proc->mapped_info[i].va, proc->mapped_info[i].npages * PGSIZE, 1);
++    proc->mapped_info[i].va = 0;
++  }
++  proc->total_mapped_region = 4;
++  return 0;
++}
++
++//
++// exec syscall in kernel.
++//
++int copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
++{
++  uint64 n, va0, pa0;
++
++  while(len > 0) {
++    va0 = ROUNDDOWN(dstva, PGSIZE);
++    pa0 = lookup_pa(pagetable, va0);
++    if(pa0 == 0)
++      return -1;
++    n = PGSIZE - (dstva - va0);
++    if(n > len)
++      n = len;
++    memmove((void *)(pa0 + (dstva - va0)), src, n);
++
++    len -= n;
++    src += n;
++    dstva = va0 + PGSIZE;
++  }
++  return 0;
++}
++int do_exec(process* proc, char* path, char **argv) {
++  // check if the file exists.
++  struct file *exist = vfs_open(path, O_RDONLY);
++  vfs_close(exist);
++  if (exist == NULL) {
++    sprint("load_bincode_from_host_elf failed.\n");
++    return -1;
++  }
++
++  // release the elf segments in memory regions
++  release_elf_seg(proc);
++  // load the new elf segments into memory regions
++  load_bincode_from_host_elf(proc, path);
++  // set the user stack pointer
++
++  // added lab4_challenge3
++  uint64 argc = 0, sp, ustack[MAX_CMDLINE_ARGS];
++  sp = USER_STACK_TOP;
++  for (argc = 0; argv[argc]; argc++)
++  {
++    if (argc >= MAX_CMDLINE_ARGS)
++      return 0;
++    sp -= strlen(argv[argc]) + 1;
++    sp -= sp % 16;
++    
++    if(copyout(proc->pagetable, sp, argv[argc], strlen(argv[argc]) + 1) < 0)
++      return -1;
++    
++    ustack[argc] = sp;
++  }
++  ustack[argc] = 0;
++  sp -= (argc+1) * sizeof(uint64);
++  sp -= sp % 16;
++  
++  if(copyout(proc->pagetable, sp, (char *)ustack, (argc+1)*sizeof(uint64)) < 0)
++    return -1;
++
++  proc->trapframe->regs.a1 = sp;
++  proc->trapframe->regs.sp = sp;
++
++  // reset the heap
++  // convert free_pages_address into a filter to skip reclaimed blocks in the heap
++  // when mapping the heap blocks
++  int free_block_filter[MAX_HEAP_PAGES];
++  memset(free_block_filter, 0, MAX_HEAP_PAGES);
++  uint64 heap_bottom = proc->user_heap.heap_bottom;
++  for (int i = 0; i < proc->user_heap.free_pages_count; i++) {
++    int index = (proc->user_heap.free_pages_address[i] - heap_bottom) / PGSIZE;
++    free_block_filter[index] = 1;
++  }
++
++  // free the heap blocks
++  for (uint64 heap_block = current->user_heap.heap_bottom;
++        heap_block < current->user_heap.heap_top; heap_block += PGSIZE) {
++    if (free_block_filter[(heap_block - heap_bottom) / PGSIZE])  // skip free blocks
++      continue;
++    user_vm_unmap((pagetable_t)proc->pagetable, heap_block, PGSIZE, 1);
++  }
++  proc->mapped_info[3].npages = 0;
++
++  // reset the heap manager
++  proc->user_heap.free_pages_count = 0;
++  proc->user_heap.heap_top = proc->user_heap.heap_bottom;
++  
++  return argc;
++}
+\ No newline at end of file
+diff --git a/kernel/process.h b/kernel/process.h
+index 5f4c63b..f259204 100644
+--- a/kernel/process.h
++++ b/kernel/process.h
+@@ -90,7 +90,7 @@ typedef struct process_t {
+ 
+   // accounting. added @lab3_3
+   int tick_count;
+-
++  bool is_waited;
+   // file system. added @lab4_1
+   proc_file_management *pfiles;
+ }process;
+@@ -107,6 +107,10 @@ int free_process( process* proc );
+ // fork a child from parent
+ int do_fork(process* parent);
+ 
++// release the elf segments in memory regions (for reload).
++int release_elf_seg(process *proc);
++// load a new ELF file in the current process
++int do_exec(process* proc, char* path, char **argv);
+ // current running process
+ extern process* current;
+ 
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 6370b12..a85eb4c 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -17,6 +17,7 @@
+ 
+ #include "spike_interface/spike_utils.h"
+ 
++extern process procs[NPROC];
+ //
+ // implement the SYS_user_print syscall
+ //
+@@ -34,8 +35,20 @@ ssize_t sys_user_print(const char* buf, size_t n) {
+ //
+ ssize_t sys_user_exit(uint64 code) {
+   sprint("User exit with code:%d.\n", code);
+-  // reclaim the current process, and reschedule. added @lab3_1
+-  free_process( current );
++  // in lab3 now, we should reclaim the current process, and reschedule.
++  if (current->is_waited) { // if I am waited? if so, do the following
++    for (int i = 0; i < NPROC; ++i) {
++      if (procs[i].parent == current->parent) {
++        procs[i].is_waited = FALSE;
++      }
++    }
++    // wakeup the parent
++    current->parent->status = READY;
++    current->parent->trapframe->regs.a0 = current->pid;
++    // insert parent into the ready queue
++    insert_to_ready_queue(current->parent);
++  }
++  free_process(current);
+   schedule();
+   return 0;
+ }
+@@ -96,7 +109,36 @@ ssize_t sys_user_yield() {
+ 
+   return 0;
+ }
+-
++ssize_t sys_user_wait(long pid) {
++  if (pid == -1) { // wait till all processes in system exit
++    int child_cnt = 0;
++    for (int i = 0; i < NPROC; ++i) {
++      if (procs[i].status == READY || procs[i].status == BLOCKED ||
++        procs[i].status == RUNNING) {
++        if (procs[i].parent == current) {
++          child_cnt++;
++          procs[i].is_waited = TRUE;
++        }
++      }
++    }
++    // doing nothing if current process is the only alive one
++    if (child_cnt == 0) {
++      return -1;
++    }
++    // sets the caller to BLOCKED status
++    current->status = BLOCKED;
++    schedule();
++  } else if (pid > 0) { // wait till process pid exits
++    if ( (pid>0) && (pid<NPROC) ) {
++      procs[pid].is_waited = TRUE;
++      current->status = BLOCKED;
++      schedule();
++    } else {
++      return -1;
++    }
++  }
++  return -1;
++}
+ //
+ // open file
+ //
+@@ -215,6 +257,16 @@ ssize_t sys_user_unlink(char * vfn){
+   return do_unlink(pfn);
+ }
+ 
++//
++// lib call to exec
++//
++ssize_t sys_user_exec(char * vfn, char *argv){
++  char *pfn = (char*)user_va_to_pa((pagetable_t)(current->pagetable), (void*)vfn);
++  char *pargv = (char*)user_va_to_pa((pagetable_t)(current->pagetable), (void*)argv);
++  char *single_argv[] = {pargv, NULL};
++  return do_exec(current, pfn, single_argv);
++
++}
+ //
+ // [a0]: the syscall number; [a1] ... [a7]: arguments to the syscalls.
+ // returns the code of success, (e.g., 0 means success, fail for otherwise)
+@@ -234,6 +286,8 @@ long do_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long a6, l
+       return sys_user_fork();
+     case SYS_user_yield:
+       return sys_user_yield();
++    case SYS_user_wait:
++      return sys_user_wait(a1);
+     // added @lab4_1
+     case SYS_user_open:
+       return sys_user_open((char *)a1, a2);
+@@ -263,6 +317,8 @@ long do_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long a6, l
+       return sys_user_link((char *)a1, (char *)a2);
+     case SYS_user_unlink:
+       return sys_user_unlink((char *)a1);
++    case SYS_user_exec:
++      return sys_user_exec((char *)a1, (char *)a2);
+     default:
+       panic("Unknown syscall %ld \n", a0);
+   }
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 0486c81..ed37dfc 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -14,6 +14,7 @@
+ // added @lab3_1
+ #define SYS_user_fork (SYS_user_base + 4)
+ #define SYS_user_yield (SYS_user_base + 5)
++#define SYS_user_wait (SYS_user_base + 6)
+ // added @lab4_1
+ #define SYS_user_open (SYS_user_base + 17)
+ #define SYS_user_read (SYS_user_base + 18)
+@@ -30,6 +31,7 @@
+ // added @lab4_3
+ #define SYS_user_link   (SYS_user_base + 28)
+ #define SYS_user_unlink (SYS_user_base + 29)
++#define SYS_user_exec   (SYS_user_base + 30)
+ 
+ long do_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7);
+ 
+diff --git a/user/user_lib.c b/user/user_lib.c
+index 1c4f6d1..085821d 100644
+--- a/user/user_lib.c
++++ b/user/user_lib.c
+@@ -167,3 +167,14 @@ int unlink_u(const char *fn){
+ int close(int fd) {
+   return do_user_call(SYS_user_close, fd, 0, 0, 0, 0, 0, 0);
+ }
++
++int exec(char *pathname, char *argv) {
++  return do_user_call(SYS_user_exec, (uint64)pathname, (uint64)argv, 0, 0, 0, 0, 0);
++}
++
++int wait(int pid) {
++    for (;;) {
++         int r = do_user_call(SYS_user_wait, pid, 0, 0, 0, 0, 0, 0);
++         if (r != -2) return r; else yield();
++    }
++}
+diff --git a/user/user_lib.h b/user/user_lib.h
+index 95a686d..5082551 100644
+--- a/user/user_lib.h
++++ b/user/user_lib.h
+@@ -13,6 +13,7 @@ void* naive_malloc();
+ void naive_free(void* va);
+ int fork();
+ void yield();
++int wait(int pid);
+ 
+ // added @ lab4_1
+ int open(const char *pathname, int flags);
+@@ -33,5 +34,5 @@ int closedir_u(int fd);
+ int link_u(const char *fn1, const char *fn2);
+ int unlink_u(const char *fn);
+ 
+-
++int exec(char *pathname, char *argv);
+ #endif

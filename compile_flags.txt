@@ -1,0 +1,10 @@
+-I.
+-I./kernel
+-I./spike_interface
+-I./util
+-march=rv64gc
+-mabi=lp64
+-D__riscv
+-D__NO_INLINE__
+-nostdlib
+-ffreestanding

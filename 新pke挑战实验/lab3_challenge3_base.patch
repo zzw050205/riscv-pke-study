@@ -1,0 +1,141 @@
+diff --git a/Makefile b/Makefile
+index 2dde5bf..6413db2 100644
+--- a/Makefile
++++ b/Makefile
+@@ -70,7 +70,7 @@ USER_OBJS  		:= $(addprefix $(OBJ_DIR)/, $(patsubst %.c,%.o,$(USER_CPPS)))
+ 
+ 
+ 
+-USER_TARGET 	:= $(OBJ_DIR)/app_two_long_loops
++USER_TARGET 	:= $(OBJ_DIR)/app_cow
+ #------------------------targets------------------------
+ $(OBJ_DIR):
+ 	@-mkdir -p $(OBJ_DIR)	
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 4ec434c..1659d32 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -95,6 +95,12 @@ ssize_t sys_user_yield() {
+ 
+   return 0;
+ }
++ssize_t sys_user_printpa(uint64 va)
++{
++  uint64 pa = (uint64)user_va_to_pa((pagetable_t)(current->pagetable), (void*)va);
++  sprint("%lx\n", pa);
++  return 0;
++}
+ 
+ //
+ // [a0]: the syscall number; [a1] ... [a7]: arguments to the syscalls.
+@@ -115,6 +121,8 @@ long do_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long a6, l
+       return sys_user_fork();
+     case SYS_user_yield:
+       return sys_user_yield();
++    case SYS_user_printpa:
++      return sys_user_printpa(a1);
+     default:
+       panic("Unknown syscall %ld \n", a0);
+   }
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index e0a1a16..cfe9ce5 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -14,7 +14,7 @@
+ // added @lab3_1
+ #define SYS_user_fork (SYS_user_base + 4)
+ #define SYS_user_yield (SYS_user_base + 5)
+-
++#define SYS_user_printpa (SYS_user_base + 6)
+ long do_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7);
+ 
+ #endif
+diff --git a/user/app_cow.c b/user/app_cow.c
+new file mode 100644
+index 0000000..ca5974a
+--- /dev/null
++++ b/user/app_cow.c
+@@ -0,0 +1,25 @@
++/*
++ * This app fork a child process to read and write the heap data from parent process.
++ * Because implemented copy on write, when child process only read the heap data,
++ * the physical address is the same as the parent process.
++ * But after writing, child process heap will have different physical address.              
++ */
++
++#include "user/user_lib.h"
++#include "util/types.h"
++
++int main(void) {
++  int *heap_data = naive_malloc();
++  printu("the physical address of parent process heap is: ");
++  printpa(heap_data);
++  int pid = fork();
++  if (pid == 0) {
++    printu("the physical address of child process heap before copy on write is: ");
++    printpa(heap_data);
++    heap_data[0] = 0;
++    printu("the physical address of child process heap after copy on write is: ");
++    printpa(heap_data);
++  }
++  exit(0);
++  return 0;
++}
+diff --git a/user/app_two_long_loops.c b/user/app_two_long_loops.c
+deleted file mode 100644
+index 2568485..0000000
+--- a/user/app_two_long_loops.c
++++ /dev/null
+@@ -1,28 +0,0 @@
+-/*
+- * The application of lab3_3.
+- * parent and child processes never give up their processor during execution.
+- */
+-
+-#include "user/user_lib.h"
+-#include "util/types.h"
+-
+-int main(void) {
+-  uint64 pid = fork();
+-  uint64 rounds = 100000000;
+-  uint64 interval = 10000000;
+-  uint64 a = 0;
+-  if (pid == 0) {
+-    printu("Child: Hello world! \n");
+-    for (uint64 i = 0; i < rounds; ++i) {
+-      if (i % interval == 0) printu("Child running %ld \n", i);
+-    }
+-  } else {
+-    printu("Parent: Hello world! \n");
+-    for (uint64 i = 0; i < rounds; ++i) {
+-      if (i % interval == 0) printu("Parent running %ld \n", i);
+-    }
+-  }
+-
+-  exit(0);
+-  return 0;
+-}
+diff --git a/user/user_lib.c b/user/user_lib.c
+index 3fcb85d..2993d3f 100644
+--- a/user/user_lib.c
++++ b/user/user_lib.c
+@@ -76,3 +76,8 @@ int fork() {
+ void yield() {
+   do_user_call(SYS_user_yield, 0, 0, 0, 0, 0, 0, 0);
+ }
++
++void printpa(int* va)
++{
++  do_user_call(SYS_user_printpa, (uint64)va, 0, 0, 0, 0, 0, 0);
++}
+\ No newline at end of file
+diff --git a/user/user_lib.h b/user/user_lib.h
+index 63e2e25..e36cf14 100644
+--- a/user/user_lib.h
++++ b/user/user_lib.h
+@@ -8,3 +8,4 @@ void* naive_malloc();
+ void naive_free(void* va);
+ int fork();
+ void yield();
++void printpa(int* va);
+\ No newline at end of file

@@ -1,0 +1,302 @@
+diff --git a/Makefile b/Makefile
+index 5ed973d..279ed6a 100644
+--- a/Makefile
++++ b/Makefile
+@@ -63,22 +63,25 @@ SPIKE_INF_LIB   := $(OBJ_DIR)/spike_interface.a
+ 
+ 
+ #---------------------	user   -----------------------
+-USER_LDS  := user/user.lds
+-USER_CPPS 		:= user/*.c 
++USER_LDS0  := user/user0.lds
++USER_LDS1  := user/user1.lds
+ 
+-USER_CPPS  		:= $(wildcard $(USER_CPPS))
+-USER_OBJS  		:= $(addprefix $(OBJ_DIR)/, $(patsubst %.c,%.o,$(USER_CPPS)))
++USER_CPP0 		:= user/app0.c user/user_lib.c
++USER_CPP1 		:= user/app1.c user/user_lib.c
+ 
++USER_OBJ0  		:= $(addprefix $(OBJ_DIR)/, $(patsubst %.c,%.o,$(USER_CPP0)))
++USER_OBJ1  		:= $(addprefix $(OBJ_DIR)/, $(patsubst %.c,%.o,$(USER_CPP1)))
+ 
+-
+-USER_TARGET 	:= $(OBJ_DIR)/app_long_loop
++USER_TARGET0 	:= $(OBJ_DIR)/app0
++USER_TARGET1 	:= $(OBJ_DIR)/app1
+ #------------------------targets------------------------
+ $(OBJ_DIR):
+ 	@-mkdir -p $(OBJ_DIR)	
+ 	@-mkdir -p $(dir $(UTIL_OBJS))
+ 	@-mkdir -p $(dir $(SPIKE_INF_OBJS))
+ 	@-mkdir -p $(dir $(KERNEL_OBJS))
+-	@-mkdir -p $(dir $(USER_OBJS))
++	@-mkdir -p $(dir $(USER_OBJ0))
++	@-mkdir -p $(dir $(USER_OBJ1))
+ 
+ $(OBJ_DIR)/%.o : %.c
+ 	@echo "compiling" $<
+@@ -103,9 +106,14 @@ $(KERNEL_TARGET): $(OBJ_DIR) $(UTIL_LIB) $(SPIKE_INF_LIB) $(KERNEL_OBJS) $(KERNE
+ 	@$(COMPILE) $(KERNEL_OBJS) $(UTIL_LIB) $(SPIKE_INF_LIB) -o $@ -T $(KERNEL_LDS)
+ 	@echo "PKE core has been built into" \"$@\"
+ 
+-$(USER_TARGET): $(OBJ_DIR) $(UTIL_LIB) $(USER_OBJS) $(USER_LDS)
++$(USER_TARGET0): $(OBJ_DIR) $(UTIL_LIB) $(USER_OBJ0) $(USER_LDS0)
++	@echo "linking" $@	...	
++	@$(COMPILE) $(USER_OBJ0) $(UTIL_LIB) -o $@ -T $(USER_LDS0)
++	@echo "User app has been built into" \"$@\"
++	
++$(USER_TARGET1): $(OBJ_DIR) $(UTIL_LIB) $(USER_OBJ1) $(USER_LDS1)
+ 	@echo "linking" $@	...	
+-	@$(COMPILE) $(USER_OBJS) $(UTIL_LIB) -o $@ -T $(USER_LDS)
++	@$(COMPILE) $(USER_OBJ1) $(UTIL_LIB) -o $@ -T $(USER_LDS1)
+ 	@echo "User app has been built into" \"$@\"
+ 
+ -include $(wildcard $(OBJ_DIR)/*/*.d)
+@@ -113,16 +121,16 @@ $(USER_TARGET): $(OBJ_DIR) $(UTIL_LIB) $(USER_OBJS) $(USER_LDS)
+ 
+ .DEFAULT_GOAL := $(all)
+ 
+-all: $(KERNEL_TARGET) $(USER_TARGET)
++all: $(KERNEL_TARGET) $(USER_TARGET0) $(USER_TARGET1)
+ .PHONY:all
+ 
+-run: $(KERNEL_TARGET) $(USER_TARGET)
++run: $(KERNEL_TARGET) $(USER_TARGET0) $(USER_TARGET1)
+ 	@echo "********************HUST PKE********************"
+-	spike $(KERNEL_TARGET) $(USER_TARGET)
++	spike -p2 $(KERNEL_TARGET) $(USER_TARGET0) $(USER_TARGET1)
+ 
+ # need openocd!
+-gdb:$(KERNEL_TARGET) $(USER_TARGET)
+-	spike --rbb-port=9824 -H $(KERNEL_TARGET) $(USER_TARGET) &
++gdb:$(KERNEL_TARGET) $(USER_TARGET0) $(USER_TARGET1)
++	spike --rbb-port=9824 -H -p2 $(KERNEL_TARGET) $(USER_TARGET0) $(USER_TARGET1) &
+ 	@sleep 1
+ 	openocd -f ./.spike.cfg &
+ 	@sleep 1
+@@ -136,7 +144,8 @@ gdb_clean:
+ 
+ objdump:
+ 	riscv64-unknown-elf-objdump -d $(KERNEL_TARGET) > $(OBJ_DIR)/kernel_dump
+-	riscv64-unknown-elf-objdump -d $(USER_TARGET) > $(OBJ_DIR)/user_dump
++	riscv64-unknown-elf-objdump -d $(USER_TARGET0) > $(OBJ_DIR)/app0_dump
++	riscv64-unknown-elf-objdump -d $(USER_TARGET1) > $(OBJ_DIR)/app1_dump
+ 
+ cscope:
+ 	find ./ -name "*.c" > cscope.files
+@@ -149,4 +158,4 @@ format:
+ 	@python ./format.py ./
+ 
+ clean:
+-	rm -fr ${OBJ_DIR}
++	rm -fr ${OBJ_DIR}
+\ No newline at end of file
+diff --git a/kernel/config.h b/kernel/config.h
+index 156ef62..cf99278 100644
+--- a/kernel/config.h
++++ b/kernel/config.h
+@@ -2,7 +2,7 @@
+ #define _CONFIG_H_
+ 
+ // we use only one HART (cpu) in fundamental experiments
+-#define NCPU 1
++#define NCPU 2
+ 
+ //interval of timer interrupt. added @lab1_3
+ #define TIMER_INTERVAL 1000000
+diff --git a/kernel/elf.c b/kernel/elf.c
+index beb3dff..5963121 100644
+--- a/kernel/elf.c
++++ b/kernel/elf.c
+@@ -111,7 +111,7 @@ void load_bincode_from_host_elf(process *p) {
+   size_t argc = parse_args(&arg_bug_msg);
+   if (!argc) panic("You need to specify the application program!\n");
+ 
+-  sprint("Application: %s\n", arg_bug_msg.argv[0]);
++  sprint("hartid = ?: Application: %s\n", arg_bug_msg.argv[0]);
+ 
+   //elf loading. elf_ctx is defined in kernel/elf.h, used to track the loading process.
+   elf_ctx elfloader;
+@@ -136,5 +136,5 @@ void load_bincode_from_host_elf(process *p) {
+   // close the host spike file
+   spike_file_close( info.f );
+ 
+-  sprint("Application program entry point (virtual address): 0x%lx\n", p->trapframe->epc);
++  sprint("hartid = ?: Application program entry point (virtual address): 0x%lx\n", p->trapframe->epc);
+ }
+diff --git a/kernel/kernel.c b/kernel/kernel.c
+index ec07e94..c9800ff 100644
+--- a/kernel/kernel.c
++++ b/kernel/kernel.c
+@@ -32,7 +32,7 @@ void load_user_program(process *proc) {
+ // s_start: S-mode entry point of riscv-pke OS kernel.
+ //
+ int s_start(void) {
+-  sprint("Enter supervisor mode...\n");
++  sprint("hartid = ?: Enter supervisor mode...\n");
+   // Note: we use direct (i.e., Bare mode) for memory mapping in lab1.
+   // which means: Virtual Address = Physical Address
+   // therefore, we need to set satp to be 0 for now. we will enable paging in lab2_x.
+@@ -43,7 +43,7 @@ int s_start(void) {
+   // the application code (elf) is first loaded into memory, and then put into execution
+   load_user_program(&user_app);
+ 
+-  sprint("Switch to user mode...\n");
++  sprint("hartid = ?: Switch to user mode...\n");
+   // switch_to() is defined in kernel/process.c
+   switch_to(&user_app);
+ 
+diff --git a/kernel/machine/mtrap.c b/kernel/machine/mtrap.c
+index 72566ba..e85069f 100644
+--- a/kernel/machine/mtrap.c
++++ b/kernel/machine/mtrap.c
+@@ -16,7 +16,7 @@ static void handle_misaligned_store() { panic("Misaligned AMO!"); }
+ 
+ // added @lab1_3
+ static void handle_timer() {
+-  int cpuid = 0;
++  int cpuid = read_csr(mhartid);
+   // setup the timer fired at next time (TIMER_INTERVAL from now)
+   *(uint64*)CLINT_MTIMECMP(cpuid) = *(uint64*)CLINT_MTIMECMP(cpuid) + TIMER_INTERVAL;
+ 
+diff --git a/kernel/sync_utils.h b/kernel/sync_utils.h
+new file mode 100644
+index 0000000..988fc4c
+--- /dev/null
++++ b/kernel/sync_utils.h
+@@ -0,0 +1,20 @@
++#ifndef _SYNC_UTILS_H_
++#define _SYNC_UTILS_H_
++
++static inline void sync_barrier(volatile int *counter, int all) {
++
++  int local;
++
++  asm volatile("amoadd.w %0, %2, (%1)\n"
++               : "=r"(local)
++               : "r"(counter), "r"(1)
++               : "memory");
++
++  if (local + 1 < all) {
++    do {
++      asm volatile("lw %0, (%1)\n" : "=r"(local) : "r"(counter) : "memory");
++    } while (local < all);
++  }
++}
++
++#endif
+\ No newline at end of file
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 562245a..7ee9f03 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -17,7 +17,7 @@
+ // implement the SYS_user_print syscall
+ //
+ ssize_t sys_user_print(const char* buf, size_t n) {
+-  sprint(buf);
++  sprint("hartid = ?: %s\n", buf);
+   return 0;
+ }
+ 
+@@ -25,9 +25,10 @@ ssize_t sys_user_print(const char* buf, size_t n) {
+ // implement the SYS_user_exit syscall
+ //
+ ssize_t sys_user_exit(uint64 code) {
+-  sprint("User exit with code:%d.\n", code);
++  sprint("hartid = ?: User exit with code:%d.\n", code);
+   // in lab1, PKE considers only one app (one process). 
+   // therefore, shutdown the system when the app calls exit()
++  sprint("hartid = ?: shutdown with code:%d.\n", code);
+   shutdown(code);
+ }
+ 
+diff --git a/user/app0.c b/user/app0.c
+new file mode 100644
+index 0000000..c1a3704
+--- /dev/null
++++ b/user/app0.c
+@@ -0,0 +1,7 @@
++#include "user_lib.h"
++#include "util/types.h"
++
++int main(void) {
++  printu(">>> app0 is expected to be executed by hart0\n");
++  exit(0);
++}
+\ No newline at end of file
+diff --git a/user/app1.c b/user/app1.c
+new file mode 100644
+index 0000000..89578f9
+--- /dev/null
++++ b/user/app1.c
+@@ -0,0 +1,7 @@
++#include "user_lib.h"
++#include "util/types.h"
++
++int main(void) {
++  printu(">>> app1 is expected to be executed by hart1\n");
++  exit(0);
++}
+\ No newline at end of file
+diff --git a/user/app_long_loop.c b/user/app_long_loop.c
+deleted file mode 100644
+index 8b4d873..0000000
+--- a/user/app_long_loop.c
++++ /dev/null
+@@ -1,20 +0,0 @@
+-/*
+- * Below is the given application for lab1_3.
+- * This app performs a long loop, during which, timers are
+- * generated and pop messages to our screen.
+- */
+-
+-#include "user_lib.h"
+-#include "util/types.h"
+-
+-int main(void) {
+-  printu("Hello world!\n");
+-  int i;
+-  for (i = 0; i < 100000000; ++i) {
+-    if (i % 5000000 == 0) printu("wait %d\n", i);
+-  }
+-
+-  exit(0);
+-
+-  return 0;
+-}
+diff --git a/user/user.lds b/user/user0.lds
+similarity index 98%
+rename from user/user.lds
+rename to user/user0.lds
+index 59a3bb8..acd0546 100644
+--- a/user/user.lds
++++ b/user/user0.lds
+@@ -11,4 +11,4 @@ SECTIONS
+   .data : { *(.data) }
+   . = ALIGN(16);
+   .bss : { *(.bss) }
+-}
++}
+\ No newline at end of file
+diff --git a/user/user1.lds b/user/user1.lds
+new file mode 100644
+index 0000000..71e1d27
+--- /dev/null
++++ b/user/user1.lds
+@@ -0,0 +1,14 @@
++OUTPUT_ARCH( "riscv" )
++
++ENTRY(main)
++
++SECTIONS
++{
++  . = 0x85000000;
++  . = ALIGN(0x1000);
++  .text : { *(.text) }
++  . = ALIGN(16);
++  .data : { *(.data) }
++  . = ALIGN(16);
++  .bss : { *(.bss) }
++}
+\ No newline at end of file

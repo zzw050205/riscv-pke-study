@@ -1,0 +1,149 @@
+diff --git a/kernel/pmm.c b/kernel/pmm.c
+index c10e007..60089f9 100644
+--- a/kernel/pmm.c
++++ b/kernel/pmm.c
+@@ -21,7 +21,7 @@ typedef struct node {
+ 
+ // g_free_mem_list is the head of the list of free physical memory pages
+ static list_node g_free_mem_list;
+-
++uint64 page_ref[(PHYS_TOP - KERN_BASE) / PGSIZE];
+ //
+ // actually creates the freepage list. each page occupies 4KB (PGSIZE), i.e., small page.
+ // PGSIZE is defined in kernel/riscv.h, ROUNDUP is defined in util/functions.h.
+@@ -39,6 +39,11 @@ void free_page(void *pa) {
+   if (((uint64)pa % PGSIZE) != 0 || (uint64)pa < free_mem_start_addr || (uint64)pa >= free_mem_end_addr)
+     panic("free_page 0x%lx \n", pa);
+ 
++  if(page_ref[COW_INDEX(pa)] > 1) { 
++    page_ref[COW_INDEX(pa)]--;
++    return;
++  }
++  page_ref[COW_INDEX(pa)] = 0;
+   // insert a physical page to g_free_mem_list
+   list_node *n = (list_node *)pa;
+   n->next = g_free_mem_list.next;
+@@ -52,7 +57,7 @@ void free_page(void *pa) {
+ void *alloc_page(void) {
+   list_node *n = g_free_mem_list.next;
+   if (n) g_free_mem_list.next = n->next;
+-
++  if (n) page_ref[COW_INDEX(n)] = 1;
+   return (void *)n;
+ }
+ 
+diff --git a/kernel/process.c b/kernel/process.c
+index 962c894..eb2f194 100644
+--- a/kernel/process.c
++++ b/kernel/process.c
+@@ -20,6 +20,7 @@
+ 
+ //Two functions defined in kernel/usertrap.S
+ extern char smode_trap_vector[];
++extern uint64 page_ref[];
+ extern void return_to_user(trapframe *, uint64 satp);
+ 
+ // trap_sec_start points to the beginning of S-mode trap segment (i.e., the entry point
+@@ -211,10 +212,17 @@ int do_fork( process* parent)
+             if (free_block_filter[(heap_block - heap_bottom) / PGSIZE])  // skip free blocks
+               continue;
+ 
+-            void* child_pa = alloc_page();
+-            memcpy(child_pa, (void*)lookup_pa(parent->pagetable, heap_block), PGSIZE);
+-            user_vm_map((pagetable_t)child->pagetable, heap_block, PGSIZE, (uint64)child_pa,
+-                        prot_to_type(PROT_WRITE | PROT_READ, 1));
++            pte_t *pte;
++            uint64 pa;
++            if((pte = page_walk(parent->pagetable, heap_block, 0)) == 0)
++              panic("pte not exist");
++            if((*pte & PTE_V) == 0)
++              panic("pte not avaluable");
++            pa = PTE2PA(*pte);
++            *pte = (*pte & ~PTE_W) | PTE_COW;
++            uint64 flags = PTE_FLAGS(*pte);
++            user_vm_map((pagetable_t)child->pagetable, heap_block, PGSIZE, pa, flags);
++            page_ref[COW_INDEX(pa)]++;;
+           }
+ 
+           child->mapped_info[HEAP_SEGMENT].npages = parent->mapped_info[HEAP_SEGMENT].npages;
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 9668580..8bcafac 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -198,7 +198,8 @@ static inline void flush_tlb(void) { asm volatile("sfence.vma zero, zero"); }
+ #define PTE_G (1L << 5)  // global
+ #define PTE_A (1L << 6)  // accessed
+ #define PTE_D (1L << 7)  // dirty
+-
++#define PTE_COW (1L << 8)
++#define COW_INDEX(pa) (((uint64)(pa) - KERN_BASE) >> 12)
+ // shift a physical address to the right place for a PTE.
+ #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
+ 
+diff --git a/kernel/strap.c b/kernel/strap.c
+index 3e82ffd..89831bc 100644
+--- a/kernel/strap.c
++++ b/kernel/strap.c
+@@ -61,9 +61,8 @@ void handle_user_page_fault(uint64 mcause, uint64 sepc, uint64 stval) {
+       // hint: first allocate a new physical page, and then, maps the new page to the
+       // virtual address that causes the page fault.
+       {
+-      uint64 newpage = (uint64)alloc_page();
+-      user_vm_map((pagetable_t)current->pagetable, ROUNDDOWN(stval, PGSIZE), PGSIZE, newpage,
+-             prot_to_type(PROT_WRITE | PROT_READ, 1));
++      if(cow_alloc((pagetable_t)current->pagetable, stval) != 0)
++          panic("cow error");
+       sprint("After copy on write, va is mapped at pa: %lx\n", lookup_pa(current->pagetable, stval));
+       }
+ 
+diff --git a/kernel/vmm.c b/kernel/vmm.c
+index 5647d8f..1347eab 100644
+--- a/kernel/vmm.c
++++ b/kernel/vmm.c
+@@ -207,6 +207,34 @@ void user_vm_unmap(pagetable_t page_dir, uint64 va, uint64 size, int free) {
+ 
+ }
+ 
++int cow_alloc(pagetable_t pagetable, uint64 va) { 
++  va = ROUNDDOWN(va, PGSIZE);
++  
++  pte_t *pte = page_walk(pagetable, va, 0);
++  if(pte == 0)
++  {
++    panic("pte error");
++    return -1;
++  }
++  uint64 pa = PTE2PA(*pte);
++  if(pa == 0)
++  {
++    panic("pa error");
++    return -1;
++  }
++    
++  uint64 flags = PTE_FLAGS(*pte);
++  if(flags & PTE_COW) { 
++    uint64 mem = (uint64)alloc_page();
++    if (mem == 0)
++      return -1;
++    memcpy((void*)mem, (void*)pa, PGSIZE);
++    user_vm_unmap(pagetable, va, PGSIZE, 1);
++    flags = (flags | PTE_W) & ~PTE_COW;
++    user_vm_map(pagetable, va, PGSIZE, mem, flags);
++  }
++  return 0;
++}
+ //
+ // debug function, print the vm space of a process. added @lab3_1
+ //
+diff --git a/kernel/vmm.h b/kernel/vmm.h
+index 1c567e5..29e6351 100644
+--- a/kernel/vmm.h
++++ b/kernel/vmm.h
+@@ -31,6 +31,7 @@ void kern_vm_init(void);
+ void *user_va_to_pa(pagetable_t page_dir, void *va);
+ void user_vm_map(pagetable_t page_dir, uint64 va, uint64 size, uint64 pa, int perm);
+ void user_vm_unmap(pagetable_t page_dir, uint64 va, uint64 size, int free);
++int cow_alloc(pagetable_t pagetable, uint64 va);
+ void print_proc_vmspace(process* proc);
+ 
+ #endif

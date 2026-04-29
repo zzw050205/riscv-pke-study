@@ -1,0 +1,426 @@
+diff --git a/Makefile b/Makefile
+index 279ed6a..0700742 100644
+--- a/Makefile
++++ b/Makefile
+@@ -158,4 +158,4 @@ format:
+ 	@python ./format.py ./
+ 
+ clean:
+-	rm -fr ${OBJ_DIR}
+\ No newline at end of file
++	rm -fr ${OBJ_DIR}
+diff --git a/kernel/config.h b/kernel/config.h
+index cf99278..76b635c 100644
+--- a/kernel/config.h
++++ b/kernel/config.h
+@@ -20,4 +20,6 @@
+ // the trap frame used to assemble the user "process"
+ #define USER_TRAP_FRAME 0x81300000
+ 
++#define USER_PROC_MEM_INTERVAL 0x00500000
++
+ #endif
+diff --git a/kernel/elf.c b/kernel/elf.c
+index 5963121..991405b 100644
+--- a/kernel/elf.c
++++ b/kernel/elf.c
+@@ -18,6 +18,8 @@ typedef struct elf_info_t {
+ //
+ static void *elf_alloc_mb(elf_ctx *ctx, uint64 elf_pa, uint64 elf_va, uint64 size) {
+   // directly returns the virtual address as we are in the Bare mode in lab1_x
++  uint64 hartid = read_tp();
++
+   return (void *)elf_va;
+ }
+ 
+@@ -54,6 +56,7 @@ elf_status elf_load(elf_ctx *ctx) {
+   // elf_prog_header structure is defined in kernel/elf.h
+   elf_prog_header ph_addr;
+   int i, off;
++  
+ 
+   // traverse the elf program segment headers
+   for (i = 0, off = ctx->ehdr.phoff; i < ctx->ehdr.phnum; i++, off += sizeof(ph_addr)) {
+@@ -106,19 +109,21 @@ static size_t parse_args(arg_buf *arg_bug_msg) {
+ //
+ void load_bincode_from_host_elf(process *p) {
+   arg_buf arg_bug_msg;
++  
++  uint64 hartid = read_tp();
+ 
+   // retrieve command line arguements
+   size_t argc = parse_args(&arg_bug_msg);
+   if (!argc) panic("You need to specify the application program!\n");
+ 
+-  sprint("hartid = ?: Application: %s\n", arg_bug_msg.argv[0]);
++  sprint("hartid = %ld: Application: %s\n", hartid, arg_bug_msg.argv[hartid]);
+ 
+   //elf loading. elf_ctx is defined in kernel/elf.h, used to track the loading process.
+   elf_ctx elfloader;
+   // elf_info is defined above, used to tie the elf file and its corresponding process.
+   elf_info info;
+ 
+-  info.f = spike_file_open(arg_bug_msg.argv[0], O_RDONLY, 0);
++  info.f = spike_file_open(arg_bug_msg.argv[hartid], O_RDONLY, 0);
+   info.p = p;
+   // IS_ERR_VALUE is a macro defined in spike_interface/spike_htif.h
+   if (IS_ERR_VALUE(info.f)) panic("Fail on openning the input application program.\n");
+@@ -136,5 +141,5 @@ void load_bincode_from_host_elf(process *p) {
+   // close the host spike file
+   spike_file_close( info.f );
+ 
+-  sprint("hartid = ?: Application program entry point (virtual address): 0x%lx\n", p->trapframe->epc);
++  sprint("hartid = %ld: Application program entry point (virtual address): 0x%lx\n", hartid, p->trapframe->epc);
+ }
+diff --git a/kernel/kernel.c b/kernel/kernel.c
+index c9800ff..559aa73 100644
+--- a/kernel/kernel.c
++++ b/kernel/kernel.c
+@@ -6,33 +6,39 @@
+ #include "string.h"
+ #include "elf.h"
+ #include "process.h"
++#include "config.h"
+ 
+ #include "spike_interface/spike_utils.h"
++#include "sync_utils.h"
+ 
+ // process is a structure defined in kernel/process.h
+-process user_app;
++process user_app[NCPU];
+ 
+ //
+ // load the elf, and construct a "process" (with only a trapframe).
+ // load_bincode_from_host_elf is defined in elf.c
+ //
+ void load_user_program(process *proc) {
++  uint64 hartid = read_tp();
+   // USER_TRAP_FRAME is a physical address defined in kernel/config.h
+-  proc->trapframe = (trapframe *)USER_TRAP_FRAME;
++  proc->trapframe = (trapframe *)USER_TRAP_FRAME + hartid * USER_PROC_MEM_INTERVAL;
+   memset(proc->trapframe, 0, sizeof(trapframe));
+   // USER_KSTACK is also a physical address defined in kernel/config.h
+-  proc->kstack = USER_KSTACK;
+-  proc->trapframe->regs.sp = USER_STACK;
++  proc->kstack = USER_KSTACK + hartid * USER_PROC_MEM_INTERVAL;
++  proc->trapframe->regs.sp = USER_STACK + hartid * USER_PROC_MEM_INTERVAL;
+ 
+   // load_bincode_from_host_elf() is defined in kernel/elf.c
+   load_bincode_from_host_elf(proc);
+ }
+ 
++volatile int sstart_harts = 0;
+ //
+ // s_start: S-mode entry point of riscv-pke OS kernel.
+ //
+ int s_start(void) {
+-  sprint("hartid = ?: Enter supervisor mode...\n");
++  uint64 hartid = read_tp();
++
++  sprint("hartid = %ld: Enter supervisor mode...\n", hartid);
+   // Note: we use direct (i.e., Bare mode) for memory mapping in lab1.
+   // which means: Virtual Address = Physical Address
+   // therefore, we need to set satp to be 0 for now. we will enable paging in lab2_x.
+@@ -41,11 +47,13 @@ int s_start(void) {
+   write_csr(satp, 0);
+ 
+   // the application code (elf) is first loaded into memory, and then put into execution
+-  load_user_program(&user_app);
++  load_user_program(&user_app[hartid]);
++
++//   sync_barrier(&sstart_harts, NCPU);
+ 
+-  sprint("hartid = ?: Switch to user mode...\n");
++  sprint("hartid = %ld: Switch to user mode...\n", hartid);
+   // switch_to() is defined in kernel/process.c
+-  switch_to(&user_app);
++  switch_to(&user_app[hartid]);
+ 
+   // we should never reach here.
+   return 0;
+diff --git a/kernel/machine/minit.c b/kernel/machine/minit.c
+index b258f71..90a8212 100644
+--- a/kernel/machine/minit.c
++++ b/kernel/machine/minit.c
+@@ -6,6 +6,7 @@
+ #include "kernel/riscv.h"
+ #include "kernel/config.h"
+ #include "spike_interface/spike_utils.h"
++#include "kernel/sync_utils.h"
+ 
+ //
+ // global variables are placed in the .data section.
+@@ -87,19 +88,25 @@ void timerinit(uintptr_t hartid) {
+   write_csr(mie, read_csr(mie) | MIE_MTIE);
+ }
+ 
++volatile int mstart_harts = 0;
++
+ //
+ // m_start: machine mode C entry point.
+ //
+ void m_start(uintptr_t hartid, uintptr_t dtb) {
+-  // init the spike file interface (stdin,stdout,stderr)
+-  // functions with "spike_" prefix are all defined in codes under spike_interface/,
+-  // sprint is also defined in spike_interface/spike_utils.c
+-  spike_file_init();
+-  sprint("In m_start, hartid:%d\n", hartid);
++  if (hartid == 0) {
++    // init the spike file interface (stdin,stdout,stderr)
++    // functions with "spike_" prefix are all defined in codes under spike_interface/,
++    // sprint is also defined in spike_interface/spike_utils.c
++    spike_file_init();
++    
++    // init HTIF (Host-Target InterFace) and memory by using the Device Table Blob (DTB)
++    // init_dtb() is defined above.
++    init_dtb(dtb);
++  }
+ 
+-  // init HTIF (Host-Target InterFace) and memory by using the Device Table Blob (DTB)
+-  // init_dtb() is defined above.
+-  init_dtb(dtb);
++  sync_barrier(&mstart_harts, NCPU);
++  sprint("In m_start, hartid:%d\n", hartid);
+ 
+   // save the address of trap frame for interrupt in M mode to "mscratch". added @lab1_2
+   write_csr(mscratch, &g_itrframe);
+@@ -127,6 +134,9 @@ void m_start(uintptr_t hartid, uintptr_t dtb) {
+   // init timing. added @lab1_3
+   timerinit(hartid);
+ 
++  // store hartid in tp
++  write_tp(hartid);
++
+   // switch to supervisor mode (S mode) and jump to s_start(), i.e., set pc to mepc
+   asm volatile("mret");
+ }
+diff --git a/kernel/machine/mtrap.c b/kernel/machine/mtrap.c
+index e85069f..e431e7d 100644
+--- a/kernel/machine/mtrap.c
++++ b/kernel/machine/mtrap.c
+@@ -44,7 +44,7 @@ void handle_mtrap() {
+     case CAUSE_ILLEGAL_INSTRUCTION:
+       // TODO (lab1_2): call handle_illegal_instruction to implement illegal instruction
+       // interception, and finish lab1_2.
+-      panic( "call handle_illegal_instruction to accomplish illegal instruction interception for lab1_2.\n" );
++      handle_illegal_instruction();
+ 
+       break;
+     case CAUSE_MISALIGNED_LOAD:
+diff --git a/kernel/process.c b/kernel/process.c
+index 5fa8d6f..0ae7e00 100644
+--- a/kernel/process.c
++++ b/kernel/process.c
+@@ -20,14 +20,15 @@ extern char smode_trap_vector[];
+ extern void return_to_user(trapframe*);
+ 
+ // current points to the currently running user-mode application.
+-process* current = NULL;
++process* current[NCPU] = {0};
+ 
+ //
+ // switch to a user-mode process
+ //
+ void switch_to(process* proc) {
+   assert(proc);
+-  current = proc;
++  uint64 hartid = read_tp();
++  current[hartid] = proc;
+ 
+   // write the smode_trap_vector (64-bit func. address) defined in kernel/strap_vector.S
+   // to the stvec privilege register, such that trap handler pointed by smode_trap_vector
+@@ -36,6 +37,7 @@ void switch_to(process* proc) {
+ 
+   // set up trapframe values (in process structure) that smode_trap_vector will need when
+   // the process next re-enters the kernel.
++  proc->trapframe->regs.tp = hartid;          // process's kernel stack
+   proc->trapframe->kernel_sp = proc->kstack;  // process's kernel stack
+   proc->trapframe->kernel_trap = (uint64)smode_trap_handler;
+ 
+@@ -50,7 +52,8 @@ void switch_to(process* proc) {
+ 
+   // set S Exception Program Counter (sepc register) to the elf entry pc.
+   write_csr(sepc, proc->trapframe->epc);
+-
++  
++//   sprint("hartid = %ld: return to user proc 0x%x\n", hartid, proc);
+   // return_to_user() is defined in kernel/strap_vector.S. switch to user mode with sret.
+   return_to_user(proc->trapframe);
+ }
+diff --git a/kernel/process.h b/kernel/process.h
+index 1e2fcf8..b1b7023 100644
+--- a/kernel/process.h
++++ b/kernel/process.h
+@@ -1,6 +1,7 @@
+ #ifndef _PROC_H_
+ #define _PROC_H_
+ 
++#include "config.h"
+ #include "riscv.h"
+ 
+ typedef struct trapframe_t {
+@@ -25,6 +26,6 @@ typedef struct process_t {
+ 
+ void switch_to(process*);
+ 
+-extern process* current;
++extern process* current[NCPU];
+ 
+ #endif
+diff --git a/kernel/strap.c b/kernel/strap.c
+index 8f3086b..7f24478 100644
+--- a/kernel/strap.c
++++ b/kernel/strap.c
+@@ -22,7 +22,8 @@ static void handle_syscall(trapframe *tf) {
+   // kernel/syscall.c) to conduct real operations of the kernel side for a syscall.
+   // IMPORTANT: return value should be returned to user app, or else, you will encounter
+   // problems in later experiments!
+-  panic( "call do_syscall to accomplish the syscall and lab1_1 here.\n" );
++  tf->regs.a0 = do_syscall(tf->regs.a0, tf->regs.a1, tf->regs.a2, tf->regs.a3, tf->regs.a4,
++                           tf->regs.a5, tf->regs.a6, tf->regs.a7);
+ 
+ }
+ 
+@@ -33,11 +34,13 @@ static uint64 g_ticks = 0;
+ // added @lab1_3
+ //
+ void handle_mtimer_trap() {
+-  sprint("Ticks %d\n", g_ticks);
++  uint64 hartid = read_tp();
++  sprint("hartid = %ld: Ticks %d\n", hartid, g_ticks);
+   // TODO (lab1_3): increase g_ticks to record this "tick", and then clear the "SIP"
+   // field in sip register.
+   // hint: use write_csr to disable the SIP_SSIP bit in sip.
+-  panic( "lab1_3: increase g_ticks by one, and clear SIP field in sip register.\n" );
++  ++g_ticks;
++  write_csr(sip, read_csr(sip) & ~SIP_SSIP);
+ 
+ }
+ 
+@@ -48,11 +51,16 @@ void handle_mtimer_trap() {
+ void smode_trap_handler(void) {
+   // make sure we are in User mode before entering the trap handling.
+   // we will consider other previous case in lab1_3 (interrupt).
++  uint64 hartid = read_tp();
++  process *current_proc = current[hartid];
++//   sprint("hartid = %ld: strap, current_proc: 0x%x\n", hartid, current_proc);
++//   sprint("hartid = %ld: strap, current addr: 0x%x\n", hartid, current);
++
+   if ((read_csr(sstatus) & SSTATUS_SPP) != 0) panic("usertrap: not from user mode");
+ 
+-  assert(current);
++  assert(current_proc);
+   // save user process counter.
+-  current->trapframe->epc = read_csr(sepc);
++  current_proc->trapframe->epc = read_csr(sepc);
+ 
+   // if the cause of trap is syscall from user application.
+   // read_csr() and CAUSE_USER_ECALL are macros defined in kernel/riscv.h
+@@ -60,7 +68,7 @@ void smode_trap_handler(void) {
+ 
+   // we need to handle the timer trap @lab1_3.
+   if (cause == CAUSE_USER_ECALL) {
+-    handle_syscall(current->trapframe);
++    handle_syscall(current_proc->trapframe);
+   } else if (cause == CAUSE_MTIMER_S_TRAP) {  //soft trap generated by timer interrupt in M mode
+     handle_mtimer_trap();
+   } else {
+@@ -69,6 +77,6 @@ void smode_trap_handler(void) {
+     panic( "unexpected exception happened.\n" );
+   }
+ 
+-  // continue (come back to) the execution of current process.
+-  switch_to(current);
++  // continue (come back to) the execution of current_proc process.
++  switch_to(current_proc);
+ }
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 7ee9f03..1e96b10 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -4,7 +4,10 @@
+ 
+ #include <stdint.h>
+ #include <errno.h>
++#include <unistd.h>
+ 
++#include "config.h"
++#include "sync_utils.h"
+ #include "util/types.h"
+ #include "syscall.h"
+ #include "string.h"
+@@ -17,19 +20,26 @@
+ // implement the SYS_user_print syscall
+ //
+ ssize_t sys_user_print(const char* buf, size_t n) {
+-  sprint("hartid = ?: %s\n", buf);
++  uint64 hartid = read_tp();
++  sprint("hardid = %ld: %s", hartid, buf);
+   return 0;
+ }
+ 
++volatile int exit_harts = 0;
+ //
+ // implement the SYS_user_exit syscall
+ //
+ ssize_t sys_user_exit(uint64 code) {
+-  sprint("hartid = ?: User exit with code:%d.\n", code);
++  uint64 hartid = read_tp();
++  sprint("hartid = %ld: User exit with code:%d.\n", hartid, code);
+   // in lab1, PKE considers only one app (one process). 
+   // therefore, shutdown the system when the app calls exit()
+-  sprint("hartid = ?: shutdown with code:%d.\n", code);
+-  shutdown(code);
++  sync_barrier(&exit_harts, NCPU);
++  if (hartid == 0) {
++    sprint("hartid = %ld: shutdown with code:%d.\n", hartid, code);
++    shutdown(code);
++  }
++  return 0;
+ }
+ 
+ //
+diff --git a/user/app0.c b/user/app0.c
+index c1a3704..8f589a7 100644
+--- a/user/app0.c
++++ b/user/app0.c
+@@ -4,4 +4,4 @@
+ int main(void) {
+   printu(">>> app0 is expected to be executed by hart0\n");
+   exit(0);
+-}
+\ No newline at end of file
++}
+diff --git a/user/app1.c b/user/app1.c
+index 89578f9..6dc7f81 100644
+--- a/user/app1.c
++++ b/user/app1.c
+@@ -4,4 +4,4 @@
+ int main(void) {
+   printu(">>> app1 is expected to be executed by hart1\n");
+   exit(0);
+-}
+\ No newline at end of file
++}
+diff --git a/user/user0.lds b/user/user0.lds
+index acd0546..59a3bb8 100644
+--- a/user/user0.lds
++++ b/user/user0.lds
+@@ -11,4 +11,4 @@ SECTIONS
+   .data : { *(.data) }
+   . = ALIGN(16);
+   .bss : { *(.bss) }
+-}
+\ No newline at end of file
++}
+diff --git a/user/user1.lds b/user/user1.lds
+index 71e1d27..c432ef8 100644
+--- a/user/user1.lds
++++ b/user/user1.lds
+@@ -11,4 +11,4 @@ SECTIONS
+   .data : { *(.data) }
+   . = ALIGN(16);
+   .bss : { *(.bss) }
+-}
+\ No newline at end of file
++}
